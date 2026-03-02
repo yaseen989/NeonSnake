@@ -5,7 +5,7 @@
 
 Fast, competitive, neon-styled multiplayer snake game with live leaderboard, power-ups, mobile joystick controls, and smooth Slither-style movement.
 
-[Play Live](https://your-vercel-url.vercel.app) • [Backend Health](https://neonsnake-production.up.railway.app/api/health)
+[Play Live](https://neonsnake-production.up.railway.app/) • [Backend Health](https://neonsnake-production.up.railway.app/api/health)
 
 </div>
 
@@ -46,5 +46,17 @@ Fast, competitive, neon-styled multiplayer snake game with live leaderboard, pow
 
 ---
 
-## Local Development
+## Gameplay
+- Desktop: move cursor to steer continuously
+- Mobile: use the left joystick
+- Eat food to score and grow
+- Grab power-ups for temporary advantages
+- Avoid colliding with snakes (including your own body)
+- Roadmap
+- Team modes / private lobbies
+- Matchmaking regions
+- Cosmetics / skins
+- Replay highlights
+- Anti-cheat and server-side telemetry
+
 
