@@ -36,3 +36,4 @@ Use Vercel for the site and host `server.ts` on a WebSocket-capable platform (Ra
    ```
 
 After this, anyone can access the public Vercel URL and join the same multiplayer world through your external WebSocket backend.
+# NeonSnake
