@@ -1,0 +1,5 @@
+{
+  "name": "neonsnake.io",
+  "description": "A high-energy, multiplayer snake game with neon 3D-like graphics and physics-based food interaction.",
+  "requestFramePermissions": []
+}
