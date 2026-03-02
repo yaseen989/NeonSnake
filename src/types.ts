@@ -13,6 +13,8 @@ export interface Player {
   angle: number;
   score: number;
   isAlive: boolean;
+  speedBoostUntil: number;
+  growthTicks: number;
 }
 
 export interface Food {
@@ -21,9 +23,18 @@ export interface Food {
   velocity: Point;
 }
 
+export type PowerUpType = 'speed' | 'growth';
+
+export interface PowerUp {
+  id: string;
+  type: PowerUpType;
+  position: Point;
+}
+
 export interface GameState {
   players: Record<string, Player>;
   foods: Food[];
+  powerUps: PowerUp[];
   width: number;
   height: number;
 }

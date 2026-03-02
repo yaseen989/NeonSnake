@@ -12,9 +12,12 @@ import {
 } from './types';
 import { Trophy, Users, Zap, Skull } from 'lucide-react';
 
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
 const App: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const joystickPadRef = useRef<HTMLDivElement>(null);
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const [connError, setConnError] = useState(false);
   const [gameState, setGameState] = useState<GameState | null>(null);
@@ -23,12 +26,99 @@ const App: React.FC = () => {
   const [isJoined, setIsJoined] = useState(false);
   const [isGameOver, setIsGameOver] = useState(false);
   const [showRules, setShowRules] = useState(true);
+  const [isTouchDevice, setIsTouchDevice] = useState(false);
+  const [joystickActive, setJoystickActive] = useState(false);
+  const [joystickKnob, setJoystickKnob] = useState({ x: 0, y: 0 });
 
   // Camera and Interpolation
   const lastStateRef = useRef<GameState | null>(null);
   const nextStateRef = useRef<GameState | null>(null);
   const lastUpdateTimestamp = useRef<number>(0);
-  const cameraRef = useRef({ x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2, zoom: 1 });
+  const cameraRef = useRef({ x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2, zoom: 0.78 });
+  const prevPlayerCountRef = useRef(0);
+  const myPlayerIdRef = useRef<string | null>(null);
+  const cursorRef = useRef<{ x: number; y: number } | null>(null);
+  const joystickCenterRef = useRef<{ x: number; y: number } | null>(null);
+  const joystickAngleRef = useRef<number | null>(null);
+  const lastSentMoveRef = useRef({ angle: 0, ts: 0 });
+  const prevScoreRef = useRef(0);
+  const prevAliveRef = useRef(true);
+
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const movementGainRef = useRef<GainNode | null>(null);
+  const movementOscRef = useRef<OscillatorNode | null>(null);
+
+  useEffect(() => {
+    myPlayerIdRef.current = myPlayerId;
+  }, [myPlayerId]);
+
+  const ensureAudioContext = () => {
+    if (!audioContextRef.current) {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return null;
+      const ctx = new AudioCtx();
+      audioContextRef.current = ctx;
+    }
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      void audioContextRef.current.resume();
+    }
+    return audioContextRef.current;
+  };
+
+  const playSfx = (frequency: number, durationSec: number, gainValue: number, type: OscillatorType = 'sine') => {
+    const ctx = ensureAudioContext();
+    if (!ctx) return;
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+    oscillator.type = type;
+    oscillator.frequency.value = frequency;
+    gain.gain.setValueAtTime(gainValue, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + durationSec);
+    oscillator.connect(gain);
+    gain.connect(ctx.destination);
+    oscillator.start();
+    oscillator.stop(ctx.currentTime + durationSec);
+  };
+
+  const startMovementHum = () => {
+    const ctx = ensureAudioContext();
+    if (!ctx) return;
+    if (movementOscRef.current || movementGainRef.current) return;
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+    oscillator.type = 'sawtooth';
+    oscillator.frequency.value = 110;
+    gain.gain.value = 0.02;
+    oscillator.connect(gain);
+    gain.connect(ctx.destination);
+    oscillator.start();
+    movementOscRef.current = oscillator;
+    movementGainRef.current = gain;
+  };
+
+  const stopMovementHum = () => {
+    if (movementOscRef.current) {
+      movementOscRef.current.stop();
+      movementOscRef.current.disconnect();
+      movementOscRef.current = null;
+    }
+    if (movementGainRef.current) {
+      movementGainRef.current.disconnect();
+      movementGainRef.current = null;
+    }
+  };
+
+  const sendMove = (angle: number) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    const changedEnough = Math.abs(angle - lastSentMoveRef.current.angle) > 0.01;
+    const timeElapsed = now - lastSentMoveRef.current.ts > 45;
+    if (!changedEnough && !timeElapsed) return;
+
+    const msg: ClientMessage = { type: 'move', angle };
+    socket.send(JSON.stringify(msg));
+    lastSentMoveRef.current = { angle, ts: now };
+  };
 
   useEffect(() => {
     const inIframe = window.self !== window.top;
@@ -50,11 +140,29 @@ const App: React.FC = () => {
         setMyPlayerId(message.playerId);
         setGameState(message.state);
         nextStateRef.current = message.state;
+        prevPlayerCountRef.current = Object.keys(message.state.players).length;
+        const myPlayer = message.state.players[message.playerId];
+        prevScoreRef.current = myPlayer?.score || 0;
+        prevAliveRef.current = myPlayer?.isAlive ?? true;
       } else if (message.type === 'update') {
         lastStateRef.current = nextStateRef.current;
         nextStateRef.current = message.state;
         lastUpdateTimestamp.current = performance.now();
         setGameState(message.state);
+
+        if (myPlayerIdRef.current) {
+          const me = message.state.players[myPlayerIdRef.current];
+          if (me) {
+            if (me.score > prevScoreRef.current) {
+              playSfx(780, 0.09, 0.06, 'triangle');
+            }
+            if (prevAliveRef.current && !me.isAlive) {
+              playSfx(120, 0.45, 0.09, 'sawtooth');
+            }
+            prevScoreRef.current = me.score;
+            prevAliveRef.current = me.isAlive;
+          }
+        }
       }
     };
 
@@ -64,10 +172,14 @@ const App: React.FC = () => {
 
     ws.onclose = () => {
       setConnError(true);
+      stopMovementHum();
     };
 
     setSocket(ws);
-    return () => ws.close();
+    return () => {
+      stopMovementHum();
+      ws.close();
+    };
   }, []);
 
   useEffect(() => {
@@ -79,32 +191,57 @@ const App: React.FC = () => {
   }, [gameState, myPlayerId]);
 
   useEffect(() => {
+    if (isJoined && !isGameOver) {
+      startMovementHum();
+    } else {
+      stopMovementHum();
+    }
+  }, [isJoined, isGameOver]);
+
+  useEffect(() => {
+    const hasTouch = navigator.maxTouchPoints > 0 || window.matchMedia('(pointer: coarse)').matches;
+    setIsTouchDevice(hasTouch);
+  }, []);
+
+  useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
-      if (!socket || !isJoined || !canvasRef.current || !myPlayerId || !nextStateRef.current) return;
-      
-      const canvas = canvasRef.current;
-      const rect = canvas.getBoundingClientRect();
-      
-      // Calculate mouse position relative to the camera-transformed world
-      const mouseX = (e.clientX - rect.left);
-      const mouseY = (e.clientY - rect.top);
-      
-      const worldMouseX = (mouseX - canvas.width / 2) / cameraRef.current.zoom + cameraRef.current.x;
-      const worldMouseY = (mouseY - canvas.height / 2) / cameraRef.current.zoom + cameraRef.current.y;
-      
-      const player = nextStateRef.current.players[myPlayerId];
-      if (!player || !player.segments[0]) return;
-      
-      const head = player.segments[0];
-      const angle = Math.atan2(worldMouseY - head.y, worldMouseX - head.x);
-      
-      const msg: ClientMessage = { type: 'move', angle };
-      socket.send(JSON.stringify(msg));
+      cursorRef.current = { x: e.clientX, y: e.clientY };
     };
 
     window.addEventListener('mousemove', handleMouseMove);
     return () => window.removeEventListener('mousemove', handleMouseMove);
-  }, [socket, isJoined, myPlayerId]);
+  }, []);
+
+  useEffect(() => {
+    let frameId = 0;
+    const tick = () => {
+      frameId = requestAnimationFrame(tick);
+      if (!isJoined || !myPlayerId || !nextStateRef.current || !canvasRef.current) return;
+      const player = nextStateRef.current.players[myPlayerId];
+      if (!player || !player.isAlive || !player.segments[0]) return;
+
+      let targetAngle: number | null = null;
+      if (joystickAngleRef.current !== null) {
+        targetAngle = joystickAngleRef.current;
+      } else if (cursorRef.current) {
+        const canvas = canvasRef.current;
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = cursorRef.current.x - rect.left;
+        const mouseY = cursorRef.current.y - rect.top;
+        const worldMouseX = (mouseX - canvas.width / 2) / cameraRef.current.zoom + cameraRef.current.x;
+        const worldMouseY = (mouseY - canvas.height / 2) / cameraRef.current.zoom + cameraRef.current.y;
+        const head = player.segments[0];
+        targetAngle = Math.atan2(worldMouseY - head.y, worldMouseX - head.x);
+      }
+
+      if (targetAngle !== null) {
+        sendMove(targetAngle);
+      }
+    };
+
+    tick();
+    return () => cancelAnimationFrame(frameId);
+  }, [isJoined, myPlayerId, socket]);
 
   // Resize handler
   useEffect(() => {
@@ -148,16 +285,26 @@ const App: React.FC = () => {
 
         // Dynamic Zoom based on proximity to other players
         let minOtherDist = 1000;
+        let aliveOthers = 0;
         (Object.values(state.players) as Player[]).forEach(other => {
           if (other.id === myPlayerId || !other.isAlive) return;
+          aliveOthers += 1;
           const dx = other.segments[0].x - head.x;
           const dy = other.segments[0].y - head.y;
           const dist = Math.sqrt(dx * dx + dy * dy);
           if (dist < minOtherDist) minOtherDist = dist;
         });
 
-        const targetZoom = Math.max(0.4, Math.min(1.5, minOtherDist / 400));
-        cameraRef.current.zoom += (targetZoom - cameraRef.current.zoom) * 0.05;
+        const playerCount = Object.keys(state.players).length;
+        if (playerCount > prevPlayerCountRef.current) {
+          cameraRef.current.zoom = Math.min(cameraRef.current.zoom, 0.58);
+        }
+        prevPlayerCountRef.current = playerCount;
+
+        const targetZoom = aliveOthers > 0
+          ? clamp(minOtherDist / 580, 0.34, 0.76)
+          : 0.72;
+        cameraRef.current.zoom += (targetZoom - cameraRef.current.zoom) * 0.08;
       }
 
       // Clear
@@ -227,6 +374,38 @@ const App: React.FC = () => {
         ctx.fillStyle = '#fff';
         ctx.fill();
         ctx.shadowBlur = 0;
+      });
+
+      // Draw Power-ups
+      state.powerUps.forEach((powerUp, idx) => {
+        const dx = powerUp.position.x - cameraRef.current.x;
+        const dy = powerUp.position.y - cameraRef.current.y;
+        if (Math.abs(dx) > canvas.width / cameraRef.current.zoom && Math.abs(dy) > canvas.height / cameraRef.current.zoom) return;
+
+        const pulse = Math.sin(performance.now() / 180 + idx) * 0.2 + 1;
+        const color = powerUp.type === 'speed' ? '#ffa500' : '#7CFC00';
+        const radius = GRID_SIZE * 0.8 * pulse;
+
+        ctx.save();
+        ctx.translate(powerUp.position.x, powerUp.position.y);
+        ctx.rotate(performance.now() / 1200);
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 25;
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.8;
+        ctx.beginPath();
+        ctx.moveTo(0, -radius);
+        ctx.lineTo(radius, 0);
+        ctx.lineTo(0, radius);
+        ctx.lineTo(-radius, 0);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(0, 0, radius * 0.25, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
       });
 
       // Draw Players
@@ -333,12 +512,56 @@ const App: React.FC = () => {
 
   const handleJoin = () => {
     if (socket && playerName.trim()) {
+      ensureAudioContext();
       const msg: ClientMessage = { type: 'join', name: playerName };
       socket.send(JSON.stringify(msg));
+      playSfx(420, 0.1, 0.08, 'square');
       setIsJoined(true);
       setIsGameOver(false);
       setShowRules(false);
     }
+  };
+
+  const handleJoystickStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const touch = e.touches[0];
+    if (!touch) return;
+    ensureAudioContext();
+    const padRect = joystickPadRef.current?.getBoundingClientRect();
+    if (!padRect) return;
+    joystickCenterRef.current = {
+      x: padRect.left + padRect.width / 2,
+      y: padRect.top + padRect.height / 2,
+    };
+    setJoystickActive(true);
+  };
+
+  const handleJoystickMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const touch = e.touches[0];
+    const center = joystickCenterRef.current;
+    if (!touch || !center) return;
+
+    const maxRadius = 48;
+    const dx = touch.clientX - center.x;
+    const dy = touch.clientY - center.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    const limitedDistance = Math.min(maxRadius, distance);
+    const angle = Math.atan2(dy, dx);
+    const knobX = Math.cos(angle) * limitedDistance;
+    const knobY = Math.sin(angle) * limitedDistance;
+
+    setJoystickKnob({ x: knobX, y: knobY });
+    if (distance > 4) {
+      joystickAngleRef.current = angle;
+    }
+  };
+
+  const handleJoystickEnd = () => {
+    joystickAngleRef.current = null;
+    joystickCenterRef.current = null;
+    setJoystickKnob({ x: 0, y: 0 });
+    setJoystickActive(false);
   };
 
   const sortedPlayers = nextStateRef.current 
@@ -351,7 +574,7 @@ const App: React.FC = () => {
       <div ref={containerRef} className="relative flex-1 w-full h-full">
         <canvas 
           ref={canvasRef} 
-          className="w-full h-full cursor-none"
+          className={`w-full h-full touch-none ${isTouchDevice ? '' : 'cursor-none'}`}
           style={{ imageRendering: 'auto' }}
         />
 
@@ -423,6 +646,28 @@ const App: React.FC = () => {
                   </div>
                 </div>
               </motion.div>
+
+              {isTouchDevice && (
+                <div className="absolute left-5 bottom-6 z-30">
+                  <div
+                    ref={joystickPadRef}
+                    className="relative w-28 h-28 rounded-full border border-white/20 bg-white/5 backdrop-blur-sm touch-none"
+                    onTouchStart={handleJoystickStart}
+                    onTouchMove={handleJoystickMove}
+                    onTouchEnd={handleJoystickEnd}
+                    onTouchCancel={handleJoystickEnd}
+                  >
+                    <div
+                      className={`absolute w-12 h-12 rounded-full border border-cyan-300/50 bg-cyan-300/20 transition-transform ${joystickActive ? 'scale-100' : 'scale-95'}`}
+                      style={{
+                        left: '50%',
+                        top: '50%',
+                        transform: `translate(calc(-50% + ${joystickKnob.x}px), calc(-50% + ${joystickKnob.y}px))`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
             </>
           )}
 
@@ -453,8 +698,8 @@ const App: React.FC = () => {
                       <h3 className="text-xs font-bold uppercase tracking-widest text-cyan-400">Game Rules</h3>
                       <div className="space-y-4">
                         {[
-                          { id: '01', text: 'Use your mouse to guide your snake through the neon grid.' },
-                          { id: '02', text: 'Collect glowing orbs to grow longer and climb the leaderboard.' },
+                          { id: '01', text: 'Use mouse aim (desktop) or the left joystick (mobile) to steer.' },
+                          { id: '02', text: 'Collect glowing orbs and power-ups to dominate the leaderboard.' },
                           { id: '03', text: 'Avoid hitting other snakes or your own body—it is fatal.' },
                           { id: '04', text: 'The arena is infinite (wraps around). Use it to your advantage.' }
                         ].map(rule => (

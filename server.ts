@@ -8,6 +8,8 @@ import {
   GameState, 
   Player, 
   Food, 
+  PowerUp,
+  PowerUpType,
   Point, 
   GAME_WIDTH, 
   GAME_HEIGHT, 
@@ -18,6 +20,15 @@ import {
   ServerMessage,
   ClientMessage
 } from "./src/types";
+
+const FOOD_COUNT = 150;
+const POWER_UP_COUNT = 10;
+const FOOD_MIN_DISTANCE_FROM_SNAKE = GRID_SIZE * 7;
+const FOOD_MIN_DISTANCE_FROM_FOOD = GRID_SIZE * 2.2;
+const POWERUP_MIN_DISTANCE_FROM_SNAKE = GRID_SIZE * 10;
+const SPEED_BOOST_MS = 7000;
+const GROWTH_TICKS_BOOST = 150;
+
 async function startServer() {
   console.log(`Starting server in ${process.env.NODE_ENV || 'development'} mode`);
   const app = express();
@@ -54,23 +65,122 @@ async function startServer() {
   const gameState: GameState = {
     players: {},
     foods: [],
+    powerUps: [],
     width: GAME_WIDTH,
     height: GAME_HEIGHT,
   };
 
   // Initialize food
-  for (let i = 0; i < 150; i++) {
+  for (let i = 0; i < FOOD_COUNT; i++) {
     gameState.foods.push(spawnFood());
+  }
+  for (let i = 0; i < POWER_UP_COUNT; i++) {
+    gameState.powerUps.push(spawnPowerUp());
+  }
+
+  function getDistanceSq(a: Point, b: Point): number {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return dx * dx + dy * dy;
+  }
+
+  function getLeastDenseCell(positions: Point[]): { cellX: number; cellY: number } {
+    const cols = 10;
+    const rows = 10;
+    const cellWidth = GAME_WIDTH / cols;
+    const cellHeight = GAME_HEIGHT / rows;
+    const counts = new Array(cols * rows).fill(0);
+
+    positions.forEach((pos) => {
+      const x = Math.max(0, Math.min(cols - 1, Math.floor(pos.x / cellWidth)));
+      const y = Math.max(0, Math.min(rows - 1, Math.floor(pos.y / cellHeight)));
+      counts[y * cols + x] += 1;
+    });
+
+    const min = Math.min(...counts);
+    const leastDense: number[] = [];
+    counts.forEach((value, index) => {
+      if (value === min) leastDense.push(index);
+    });
+
+    const selected = leastDense[Math.floor(Math.random() * leastDense.length)];
+    return { cellX: selected % cols, cellY: Math.floor(selected / cols) };
+  }
+
+  function randomPointInCell(cellX: number, cellY: number): Point {
+    const cols = 10;
+    const rows = 10;
+    const cellWidth = GAME_WIDTH / cols;
+    const cellHeight = GAME_HEIGHT / rows;
+    const xMin = cellX * cellWidth;
+    const yMin = cellY * cellHeight;
+    const x = xMin + Math.random() * cellWidth;
+    const y = yMin + Math.random() * cellHeight;
+    return {
+      x: Math.floor(x / GRID_SIZE) * GRID_SIZE + GRID_SIZE / 2,
+      y: Math.floor(y / GRID_SIZE) * GRID_SIZE + GRID_SIZE / 2,
+    };
+  }
+
+  function isFarFromSnakes(position: Point, minDistance: number): boolean {
+    const minDistanceSq = minDistance * minDistance;
+    return Object.values(gameState.players).every((player) =>
+      player.segments.every((segment) => getDistanceSq(segment, position) >= minDistanceSq)
+    );
+  }
+
+  function isFarFromFoods(position: Point, minDistance: number): boolean {
+    const minDistanceSq = minDistance * minDistance;
+    return gameState.foods.every((food) => getDistanceSq(food.position, position) >= minDistanceSq);
   }
 
   function spawnFood(): Food {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const leastDenseCell = getLeastDenseCell(gameState.foods.map((food) => food.position));
+      const point = randomPointInCell(leastDenseCell.cellX, leastDenseCell.cellY);
+      if (
+        isFarFromSnakes(point, FOOD_MIN_DISTANCE_FROM_SNAKE) &&
+        isFarFromFoods(point, FOOD_MIN_DISTANCE_FROM_FOOD)
+      ) {
+        return {
+          id: crypto.randomUUID(),
+          position: point,
+          velocity: { x: 0, y: 0 },
+        };
+      }
+    }
+
     return {
-      id: Math.random().toString(36).substr(2, 9),
+      id: crypto.randomUUID(),
       position: {
         x: Math.floor(Math.random() * (GAME_WIDTH / GRID_SIZE)) * GRID_SIZE + GRID_SIZE / 2,
         y: Math.floor(Math.random() * (GAME_HEIGHT / GRID_SIZE)) * GRID_SIZE + GRID_SIZE / 2,
       },
-      velocity: { x: 0, y: 0 }
+      velocity: { x: 0, y: 0 },
+    };
+  }
+
+  function spawnPowerUp(): PowerUp {
+    const types: PowerUpType[] = ['speed', 'growth'];
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const leastDenseCell = getLeastDenseCell(gameState.powerUps.map((powerUp) => powerUp.position));
+      const point = randomPointInCell(leastDenseCell.cellX, leastDenseCell.cellY);
+      if (isFarFromSnakes(point, POWERUP_MIN_DISTANCE_FROM_SNAKE)) {
+        return {
+          id: crypto.randomUUID(),
+          type: types[Math.floor(Math.random() * types.length)],
+          position: point,
+        };
+      }
+    }
+
+    return {
+      id: crypto.randomUUID(),
+      type: types[Math.floor(Math.random() * types.length)],
+      position: {
+        x: Math.floor(Math.random() * (GAME_WIDTH / GRID_SIZE)) * GRID_SIZE + GRID_SIZE / 2,
+        y: Math.floor(Math.random() * (GAME_HEIGHT / GRID_SIZE)) * GRID_SIZE + GRID_SIZE / 2,
+      },
     };
   }
 
@@ -147,6 +257,8 @@ async function startServer() {
           angle: 0,
           score: 0,
           isAlive: true,
+          speedBoostUntil: 0,
+          growthTicks: 0,
         };
 
         gameState.players[playerId] = player;
@@ -191,7 +303,9 @@ async function startServer() {
       if (!player.isAlive) return;
 
       const head = player.segments[0];
-      const speed = SNAKE_SPEED;
+      const now = Date.now();
+      const isSpeedBoosted = player.speedBoostUntil > now;
+      const speed = SNAKE_SPEED * (isSpeedBoosted ? 1.45 : 1);
       
       const newHead = {
         x: (head.x + player.direction.x * speed + GAME_WIDTH) % GAME_WIDTH,
@@ -232,8 +346,29 @@ async function startServer() {
         }
       });
 
+      // Check power-up collision
+      for (let i = gameState.powerUps.length - 1; i >= 0; i--) {
+        const powerUp = gameState.powerUps[i];
+        const dx = newHead.x - powerUp.position.x;
+        const dy = newHead.y - powerUp.position.y;
+        const distSq = dx * dx + dy * dy;
+        if (distSq < (GRID_SIZE * 1.3) * (GRID_SIZE * 1.3)) {
+          if (powerUp.type === 'speed') {
+            player.speedBoostUntil = now + SPEED_BOOST_MS;
+          } else {
+            player.growthTicks += GROWTH_TICKS_BOOST;
+          }
+          player.score += 25;
+          gameState.powerUps[i] = spawnPowerUp();
+        }
+      }
+
       if (!ate) {
-        player.segments.pop();
+        if (player.growthTicks > 0) {
+          player.growthTicks -= 1;
+        } else {
+          player.segments.pop();
+        }
       }
     });
   }
